@@ -1,0 +1,17 @@
+services:
+  nice-jawn:
+    build: .
+    restart: unless-stopped
+    environment:
+      HA_URL: ${HA_URL}
+      HA_TOKEN: ${HA_TOKEN}
+      BSKY_HANDLE: ${BSKY_HANDLE:-nice.bof.fish}
+      BSKY_APP_PASSWORD: ${BSKY_APP_PASSWORD}
+      NJ_PLACE: ${NJ_PLACE:-South Philly}
+      NJ_MORNING: ${NJ_MORNING:-07:00}
+      NJ_EVENING: ${NJ_EVENING:-20:30}
+      NJ_DRY_RUN: ${NJ_DRY_RUN:-0}
+    volumes:
+      - nice-jawn-state:/data
+volumes:
+  nice-jawn-state:
