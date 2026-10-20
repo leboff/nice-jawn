@@ -45,6 +45,7 @@ TODAY_ID = "sensor.better_weather_nice_today"
 TMRW_ID = "sensor.better_weather_nice_tomorrow"
 SKILL_ID = "sensor.better_weather_forecast_skill"
 DAILY_ID = "sensor.better_weather_daily_forecast"
+RANK_ID = "sensor.better_weather_nice_day_rank"
 MAX_GRAPHEMES = 300
 
 
@@ -134,7 +135,40 @@ def gather(slot):
     }
     if slot == "evening":
         d["lookback"] = lookback(now.date())
+        d["rank"] = day_rank(now.date())
     return d
+
+
+def day_rank(today):
+    """Today's place among every measured day (Better Weather >= 0.3.3), only once today itself is ranked."""
+    try:
+        st = ha_state(RANK_ID)
+    except requests.RequestException:
+        return None
+    a = st.get("attributes") or {}
+    latest = a.get("latest") or {}
+    if latest.get("date") != today.isoformat() or not latest.get("rank") or not latest.get("of"):
+        return None
+    return {"rank": latest["rank"], "of": latest["of"], "tied": latest.get("tied") or 0,
+            "score": latest.get("score"), "since": a.get("since")}
+
+
+def ordinal(n):
+    return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+
+def rank_line(rk):
+    since = ""
+    if rk.get("since"):
+        s = date.fromisoformat(rk["since"])
+        since = f" since {s.strftime('%b')} {s.year}"
+    if rk["rank"] == 1 and not rk["tied"]:
+        return f"Best day measured{since} ({rk['of']} days)."
+    place = "best" if rk["rank"] == 1 else f"{ordinal(rk['rank'])} best"
+    if rk["rank"] > rk["of"] / 2:
+        worst = rk["of"] - rk["rank"] - rk["tied"] + 1
+        place = "worst" if worst == 1 else f"{ordinal(worst)} worst"
+    return f"Today {'tied for' if rk['tied'] else 'was the'} {place} of {rk['of']} days measured{since}."
 
 
 def lookback(today):
@@ -205,6 +239,8 @@ def post_text(d):
         diff = lb["observed"] - lb["forecast"]
         verdict = "called it" if abs(diff) <= 3 else f"{'+' if diff > 0 else '−'}{abs(diff)}"
         lines.append(f"Today: forecast {lb['forecast']}, measured {lb['observed']} ({verdict}).")
+    if d.get("rank"):
+        lines.append(rank_line(d["rank"]))
     text = "\n".join(lines)
     while len(text) > MAX_GRAPHEMES and d["breakdown"]:
         lines = [ln for ln in lines if not ln.startswith("Docked")] + [factor_line(d["breakdown"], limit=1)]
@@ -219,7 +255,8 @@ def alt_text(d):
     hrs = ", ".join(f"{hour_label(t.hour)} {s}" for t, s, _ in d["hours"])
     rows = "; ".join(f"{r['label']} {round(r['points'])} of {round(r['max'])} ({r.get('detail', '')})" for r in d["breakdown"])
     return (f"Nice score card for {d['day'].strftime('%A %B')} {d['day'].day} in {PLACE}: {d['score']} out of 100, {d['word']}. "
-            f"Factors: {rows}. Hourly scores: {hrs}.")[:2000]
+            f"Factors: {rows}. Hourly scores: {hrs}."
+            + (f" {rank_line(d['rank'])}" if d.get("rank") else ""))[:2000]
 
 
 def gather_now():
@@ -475,6 +512,7 @@ def build_reply(text_in):
     if TOMORROW_RE.search(text_in or ""):
         d = gather("evening")
         d.pop("lookback", None)
+        d.pop("rank", None)
         return post_text(d), card(d), alt_text(d), "tomorrow"
     d = gather_now()
     return now_text(d), card(d), now_alt(d), "now"
