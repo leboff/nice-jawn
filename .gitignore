@@ -1,3 +1,4 @@
 .env
 __pycache__/
 .dokploy_compose_id
+.logs.py
