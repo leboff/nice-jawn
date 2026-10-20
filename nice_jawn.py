@@ -309,8 +309,7 @@ def bsky_post(text, png, alt):
                       json={"repo": sess["did"], "collection": "app.bsky.feed.post", "record": record}, headers=auth, timeout=30)
     r.raise_for_status()
     uri = r.json()["uri"]
-    handle = os.environ["BSKY_HANDLE"]
-    return f"https://bsky.app/profile/{handle}/post/{uri.rsplit('/', 1)[-1]}"
+    return f"https://bsky.app/profile/{sess['did']}/post/{uri.rsplit('/', 1)[-1]}"
 
 
 # ---------------------------------------------------------------- state + run
@@ -358,7 +357,14 @@ def slot_times(day):
 
 def serve():
     """Post each slot once per day. Catch up a missed slot for up to 45 min (restart/redeploy), never later."""
-    log.info("serving: %s", {k: v.strftime("%H:%M") for k, v in slot_times(date.today()).items()})
+    log.info("serving: %s, dry_run=%s", {k: v.strftime("%H:%M") for k, v in slot_times(date.today()).items()},
+             os.environ.get("NJ_DRY_RUN") == "1")
+    # Startup self-check: render both posts without posting, so a deploy proves HA + rendering work.
+    for slot in ("morning", "evening"):
+        try:
+            run(slot, dry_run=True)
+        except Exception:  # noqa: BLE001
+            log.exception("startup self-check failed for %s", slot)
     while True:
         now = datetime.now(TZ)
         st = load_state()
