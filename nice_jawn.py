@@ -9,7 +9,12 @@ Text is a fixed template over real sensor numbers, no generated prose. Every pos
 
 Usage:
   python nice_jawn.py morning|evening [--dry-run] [--out DIR]   one post
-  python nice_jawn.py serve                                       scheduler loop (container entrypoint)
+  python nice_jawn.py now [--out DIR]                             render the on-demand "right now" reply (never posts)
+  python nice_jawn.py serve                                       scheduler + mention loop (container entrypoint)
+
+On demand: mention the account ("hey @nice.bof.fish how are we looking") and it replies in-thread with the
+live score + a card (factor bars, today's hours: solid = measured, faded = forecast). "tomorrow" in the
+mention gets tomorrow's forecast instead. NJ_REPLIES=live|dry|off (default dry).
 
 Env: HA_URL, HA_TOKEN (read-only use), BSKY_HANDLE, BSKY_APP_PASSWORD, BSKY_PDS (default https://bsky.social),
      NJ_STATE (state dir, default /data), NJ_PLACE (default "South Philly"), NJ_TZ (default America/New_York),
@@ -20,6 +25,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import UTC, date, datetime, timedelta
@@ -216,6 +222,79 @@ def alt_text(d):
             f"Factors: {rows}. Hourly scores: {hrs}.")[:2000]
 
 
+def gather_now():
+    now = datetime.now(TZ)
+    st = ha_state(NOW_ID)
+    score = number(st)
+    if score is None:
+        raise RuntimeError(f"{NOW_ID} unavailable ({st.get('state')})")
+    a = st.get("attributes") or {}
+    td = ha_state(TODAY_ID)
+    ta = td.get("attributes") or {}
+    today = number(td)
+    return {
+        "slot": "now", "day": now.date(), "at": now, "score": round(score), "word": word(score),
+        "breakdown": a.get("breakdown") or [], "why": a.get("why") or "", "inputs": a.get("inputs") or {},
+        "sun_counted": a.get("sun_counted"), "hours": local_hours(ta.get("hourly") or []),
+        "today": None if today is None else round(today), "rain_hours": 0, "daily": {},
+    }
+
+
+def clock(t):
+    return t.strftime("%I:%M%p").lstrip("0").lower()
+
+
+def now_text(d):
+    t, i = d["at"], d["inputs"]
+    lines = [f"Right now in {PLACE} ({clock(t)}): {d['score']}/100, {d['word']}."]
+    if d["why"].startswith("Raining"):
+        lines.append("Raining, so it's capped.")
+    bits = []
+    if i.get("feels_f") is not None:
+        bits.append(f"feels {round(i['feels_f'])}°")
+    if i.get("dew_f") is not None:
+        bits.append(f"dew point {round(i['dew_f'])}°")
+    if i.get("wind_mph") is not None:
+        g = i.get("gust_mph")
+        bits.append(f"wind {round(i['wind_mph'])} mph" + (f", gusts {round(g)}" if g is not None and g >= 15 else ""))
+    if d["sun_counted"] and i.get("sun_pct") is not None:
+        bits.append(f"sun {round(i['sun_pct'])}% of a clear sky")
+    if bits:
+        ln = ", ".join(bits) + "."
+        lines.append(ln[0].upper() + ln[1:])
+    fl = factor_line(d["breakdown"])
+    if fl and fl.startswith("Docked"):
+        lines.append(fl)
+    rest = [h for h in d["hours"] if h[0] > t]
+    tail = []
+    if rest:
+        lo, hi = min(s for _, s, _ in rest), max(s for _, s, _ in rest)
+        rng = f"{lo}" if lo == hi else f"{lo}–{hi}"
+        if lo >= 80:
+            tail.append(f"Rest of today: {rng}, nice through {hour_label(rest[-1][0].hour + 1, end=True)}.")
+        else:
+            tail.append(f"Rest of today: {rng}, best {window_text(best_window(rest))}.")
+    if d["today"] is not None:
+        tail.append(f"Day avg {d['today']}.")
+    if tail:
+        lines.append(" ".join(tail))
+    # Trim whole lines, least important first, rather than cutting mid-sentence.
+    for drop in (None, "Docked", "Rest of today"):
+        if drop:
+            lines = [ln for ln in lines if not ln.startswith(drop)]
+        text = "\n".join(lines)
+        if len(text) <= MAX_GRAPHEMES:
+            return text
+    return text[:MAX_GRAPHEMES]
+
+
+def now_alt(d):
+    hrs = ", ".join(f"{hour_label(t.hour)} {s} ({'measured' if src == 'station' else 'forecast'})" for t, s, src in d["hours"])
+    rows = "; ".join(f"{r['label']} {round(r['points'])} of {round(r['max'])} ({r.get('detail', '')})" for r in d["breakdown"])
+    return (f"Nice score right now ({clock(d['at'])}, {d['day'].strftime('%A %B')} {d['day'].day}) in {PLACE}: "
+            f"{d['score']} out of 100, {d['word']}. Factors: {rows}. Today's hours: {hrs}.")[:2000]
+
+
 # ---------------------------------------------------------------- image
 W, Hh = 1200, 675
 BG, FG, MUTED, TRACK = (250, 250, 247), (24, 24, 27), (113, 113, 122), (228, 228, 231)
@@ -243,9 +322,13 @@ def card(d):
     im = Image.new("RGB", (W, Hh), BG)
     g = ImageDraw.Draw(im)
     M = 56
-    when = "Today" if d["slot"] == "morning" else "Tomorrow"
+    is_now = d["slot"] == "now"
+    when = "Right now" if is_now else "Today" if d["slot"] == "morning" else "Tomorrow"
     g.text((M, 44), "NICE JAWN", font=font(22, True), fill=MUTED)
-    g.text((M, 74), f"{when} · {d['day'].strftime('%A, %B')} {d['day'].day} · {PLACE}", font=font(30, True), fill=FG)
+    sub = f"{clock(d['at'])} · {PLACE}" if is_now else f"{d['day'].strftime('%A, %B')} {d['day'].day} · {PLACE}"
+    g.text((M, 74), f"{when} · {sub}", font=font(30, True), fill=FG)
+    if is_now and d.get("today") is not None:
+        g.text((M, 116), f"Today's day average: {d['today']}", font=font(22), fill=MUTED)
     # big score
     sc = str(d["score"])
     g.text((W - M, 40), sc, font=font(110, True), fill=col(d["score"]), anchor="ra")
@@ -277,39 +360,172 @@ def card(d):
         x0 = M + i * (bw + gap)
         h = max(6, (base - top) * s / 100)
         c = col(s)
-        if src != "station":
-            c = tuple(int(v + (255 - v) * 0.35) for v in c)
+        if src != "station":   # forecast hours faded, like the HA card (solid = measured)
+            fade = 0.6 if is_now else 0.35
+            c = tuple(int(v + (b - v) * fade) for v, b in zip(c, BG))
         g.rounded_rectangle((x0, base - h, x0 + bw, base), radius=5, fill=c)
-        if i % 2 == 0 or n <= 8:
+        cur = is_now and t.hour == d["at"].hour
+        if cur:
+            g.text((x0 + bw / 2, base + 6), "now", font=font(20, True), fill=FG, anchor="ma")
+        elif (i % 2 == 0 or n <= 8) and not (is_now and abs(t.hour - d["at"].hour) == 1):
             g.text((x0 + bw / 2, base + 8), hour_label(t.hour), font=font(19), fill=MUTED, anchor="ma")
-    g.text((M, Hh - 18), "0–100 for temp, humidity, wind & sun, each waking hour · backyard station + GEM/ICON/ECMWF blend",
-           font=font(17), fill=MUTED, anchor="lb")
+    foot = ("Today's hours: solid = measured in the backyard · faded = forecast" if is_now else
+            "0–100 for temp, humidity, wind & sun, each waking hour · backyard station + GEM/ICON/ECMWF blend")
+    g.text((M, Hh - 18), foot, font=font(17), fill=MUTED, anchor="lb")
     buf = io.BytesIO()
     im.save(buf, "PNG", optimize=True)
     return buf.getvalue()
 
 
 # ---------------------------------------------------------------- bluesky
+class Bsky:
+    """One login, reused: refreshes on expiry instead of calling createSession every poll (that's rate-limited)."""
+
+    def __init__(self):
+        self.pds = os.environ.get("BSKY_PDS", "https://bsky.social").rstrip("/")
+        self.sess = None
+
+    def _login(self):
+        r = requests.post(f"{self.pds}/xrpc/com.atproto.server.createSession",
+                          json={"identifier": os.environ["BSKY_HANDLE"], "password": os.environ["BSKY_APP_PASSWORD"]},
+                          timeout=30)
+        r.raise_for_status()
+        self.sess = r.json()
+
+    def _refresh(self):
+        r = requests.post(f"{self.pds}/xrpc/com.atproto.server.refreshSession",
+                          headers={"Authorization": f"Bearer {self.sess['refreshJwt']}"}, timeout=30)
+        if r.ok:
+            self.sess.update(r.json())
+        else:
+            self._login()
+
+    @property
+    def did(self):
+        if not self.sess:
+            self._login()
+        return self.sess["did"]
+
+    def call(self, method, nsid, headers=None, **kw):
+        if not self.sess:
+            self._login()
+        for attempt in (0, 1):
+            h = {"Authorization": f"Bearer {self.sess['accessJwt']}"} | (headers or {})
+            r = requests.request(method, f"{self.pds}/xrpc/{nsid}", headers=h, timeout=60, **kw)
+            if attempt == 0 and r.status_code in (400, 401):
+                try:
+                    err = r.json().get("error")
+                except ValueError:
+                    err = None
+                if r.status_code == 401 or err in ("ExpiredToken", "InvalidToken"):
+                    self._refresh()
+                    continue
+            r.raise_for_status()
+            return r.json() if r.content else {}
+
+    def post(self, text, png, alt, reply=None):
+        blob = self.call("POST", "com.atproto.repo.uploadBlob", data=png, headers={"Content-Type": "image/png"})["blob"]
+        record = {
+            "$type": "app.bsky.feed.post", "text": text, "langs": ["en"],
+            "createdAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "embed": {"$type": "app.bsky.embed.images",
+                      "images": [{"alt": alt, "image": blob, "aspectRatio": {"width": W, "height": Hh}}]},
+        }
+        if reply:
+            record["reply"] = reply
+        r = self.call("POST", "com.atproto.repo.createRecord",
+                      json={"repo": self.did, "collection": "app.bsky.feed.post", "record": record})
+        return f"https://bsky.app/profile/{self.did}/post/{r['uri'].rsplit('/', 1)[-1]}", r
+
+
+_CLIENT = None
+
+
+def client():
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = Bsky()
+    return _CLIENT
+
+
 def bsky_post(text, png, alt):
-    pds = os.environ.get("BSKY_PDS", "https://bsky.social").rstrip("/")
-    s = requests.post(f"{pds}/xrpc/com.atproto.server.createSession",
-                      json={"identifier": os.environ["BSKY_HANDLE"], "password": os.environ["BSKY_APP_PASSWORD"]}, timeout=30)
-    s.raise_for_status()
-    sess = s.json()
-    auth = {"Authorization": f"Bearer {sess['accessJwt']}"}
-    b = requests.post(f"{pds}/xrpc/com.atproto.repo.uploadBlob", data=png, headers=auth | {"Content-Type": "image/png"}, timeout=60)
-    b.raise_for_status()
-    record = {
-        "$type": "app.bsky.feed.post", "text": text, "langs": ["en"],
-        "createdAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        "embed": {"$type": "app.bsky.embed.images",
-                  "images": [{"alt": alt, "image": b.json()["blob"], "aspectRatio": {"width": W, "height": Hh}}]},
-    }
-    r = requests.post(f"{pds}/xrpc/com.atproto.repo.createRecord",
-                      json={"repo": sess["did"], "collection": "app.bsky.feed.post", "record": record}, headers=auth, timeout=30)
-    r.raise_for_status()
-    uri = r.json()["uri"]
-    return f"https://bsky.app/profile/{sess['did']}/post/{uri.rsplit('/', 1)[-1]}"
+    return client().post(text, png, alt)[0]
+
+
+# ---------------------------------------------------------------- mentions (on-demand replies)
+TOMORROW_RE = re.compile(r"\b(tomorrow|tmrw|tmr|tomorow)\b", re.I)
+REPLY_COOLDOWN_S = int(os.environ.get("NJ_REPLY_COOLDOWN_S", "120"))   # per asker
+REPLY_HOURLY_CAP = int(os.environ.get("NJ_REPLY_HOURLY_CAP", "20"))    # whole account
+MENTION_BACKLOG_MIN = 30    # on first start, answer mentions at most this old
+
+
+def mentions_me(record, did):
+    for f in record.get("facets") or []:
+        for feat in f.get("features") or []:
+            if feat.get("$type") == "app.bsky.richtext.facet#mention" and feat.get("did") == did:
+                return True
+    return False
+
+
+def ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def build_reply(text_in):
+    if TOMORROW_RE.search(text_in or ""):
+        d = gather("evening")
+        d.pop("lookback", None)
+        return post_text(d), card(d), alt_text(d), "tomorrow"
+    d = gather_now()
+    return now_text(d), card(d), now_alt(d), "now"
+
+
+def check_mentions(bs, mode):
+    """Answer new @mentions (and replies that @mention us) in-thread. Returns how many were answered."""
+    st = load_state()
+    m = st.setdefault("mentions", {})
+    now = datetime.now(UTC)
+    since = ts(m["since"]) if m.get("since") else now - timedelta(minutes=MENTION_BACKLOG_MIN)
+    notes = bs.call("GET", "app.bsky.notification.listNotifications", params={"limit": 40}).get("notifications") or []
+    handled = set(m.get("handled", []))
+    last_by = m.setdefault("last_by", {})
+    sent = [t for t in m.get("sent", []) if now - ts(t) < timedelta(hours=1)]
+    newest, answered = since, 0
+    for n in sorted(notes, key=lambda x: x["indexedAt"]):
+        at = ts(n["indexedAt"])
+        if at <= since or n["uri"] in handled:
+            continue
+        newest = max(newest, at)
+        rec, author = n.get("record") or {}, (n.get("author") or {}).get("did")
+        if author == bs.did or n["reason"] not in ("mention", "reply"):
+            continue
+        if n["reason"] == "reply" and not mentions_me(rec, bs.did):
+            continue        # a plain reply to one of our posts ("lol") isn't a request
+        handled.add(n["uri"])
+        who = (n.get("author") or {}).get("handle", author)
+        if author in last_by and (now - ts(last_by[author])).total_seconds() < REPLY_COOLDOWN_S:
+            log.info("mention from %s skipped: cooldown", who)
+            continue
+        if len(sent) >= REPLY_HOURLY_CAP:
+            log.warning("mention from %s skipped: hourly cap", who)
+            continue
+        text, png, alt, kind = build_reply(rec.get("text", ""))
+        parent = {"uri": n["uri"], "cid": n["cid"]}
+        root = (rec.get("reply") or {}).get("root") or parent
+        log.info("mention from %s (%s) -> %s reply%s:\n%s", who, n["uri"], kind, "" if mode == "live" else " [dry]", text)
+        if mode == "live":
+            url, _ = bs.post(text, png, alt, reply={"root": root, "parent": parent})
+            log.info("replied %s", url)
+        last_by[author] = now.isoformat()
+        sent.append(now.isoformat())
+        answered += 1
+    m["since"] = newest.isoformat()
+    m["handled"] = sorted(handled)[-300:]
+    m["sent"] = sent
+    m["last_by"] = {k: v for k, v in last_by.items() if now - ts(v) < timedelta(days=1)}
+    st["mentions"] = m
+    save_state(st)
+    return answered
 
 
 # ---------------------------------------------------------------- state + run
@@ -328,8 +544,13 @@ def save_state(st):
 
 
 def run(slot, *, dry_run=False, out=None):
-    d = gather(slot)
-    text, png, alt = post_text(d), card(d), alt_text(d)
+    if slot == "now":
+        d = gather_now()
+        text, png, alt = now_text(d), card(d), now_alt(d)
+        dry_run = True      # "now" is only ever a reply; rendering it standalone never posts
+    else:
+        d = gather(slot)
+        text, png, alt = post_text(d), card(d), alt_text(d)
     if out:
         Path(out).mkdir(parents=True, exist_ok=True)
         (Path(out) / f"{slot}.png").write_bytes(png)
@@ -356,15 +577,18 @@ def slot_times(day):
 
 
 def serve():
-    """Post each slot once per day. Catch up a missed slot for up to 45 min (restart/redeploy), never later."""
-    log.info("serving: %s, dry_run=%s", {k: v.strftime("%H:%M") for k, v in slot_times(date.today()).items()},
-             os.environ.get("NJ_DRY_RUN") == "1")
-    # Startup self-check: render both posts without posting, so a deploy proves HA + rendering work.
-    for slot in ("morning", "evening"):
+    """Post each slot once per day (catch up a missed slot for up to 45 min, never later) and answer mentions."""
+    replies = os.environ.get("NJ_REPLIES", "dry")
+    log.info("serving: %s, dry_run=%s, replies=%s", {k: v.strftime("%H:%M") for k, v in slot_times(date.today()).items()},
+             os.environ.get("NJ_DRY_RUN") == "1", replies)
+    # Startup self-check: render every post type without posting, so a deploy proves HA + rendering work.
+    for slot in ("morning", "evening", "now"):
         try:
             run(slot, dry_run=True)
         except Exception:  # noqa: BLE001
             log.exception("startup self-check failed for %s", slot)
+    poll = int(os.environ.get("NJ_MENTION_POLL_S", "20"))
+    backoff = 0
     while True:
         now = datetime.now(TZ)
         st = load_state()
@@ -383,7 +607,15 @@ def serve():
                 except Exception:  # noqa: BLE001 - log and retry; never crash the loop
                     log.exception("%s attempt %d failed", slot, attempt + 1)
                     time.sleep(120)
-        time.sleep(30)
+        if replies in ("live", "dry"):
+            try:
+                check_mentions(client(), replies)
+                backoff = 0
+            except Exception:  # noqa: BLE001
+                backoff = min(300, max(60, backoff * 2))
+                log.exception("mention check failed; backing off %ds", backoff)
+                time.sleep(backoff)
+        time.sleep(poll)
 
 
 if __name__ == "__main__":
