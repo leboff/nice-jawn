@@ -485,8 +485,8 @@ def card(d):
             g.text((x0 + bw / 2, base + 6), "now", font=font(20, True), fill=FG, anchor="ma")
         elif (i % 2 == 0 or n <= 8) and not (is_now and abs(t.hour - d["at"].hour) == 1):
             g.text((x0 + bw / 2, base + 8), hour_label(t.hour), font=font(19), fill=MUTED, anchor="ma")
-    foot = ("Today's hours: solid = measured in the backyard · faded = forecast" if is_now else
-            "0–100 for temp, humidity, wind & sun, each waking hour · backyard station + GEM/ICON/ECMWF blend")
+    foot = ("Today's hours: solid = measured on the rooftop · faded = forecast" if is_now else
+            "0–100 for temp, humidity, wind & sun, each waking hour · rooftop station + GEM/ICON/ECMWF blend")
     g.text((M, Hh - 18), foot, font=font(17), fill=MUTED, anchor="lb")
     buf = io.BytesIO()
     im.save(buf, "PNG", optimize=True)
@@ -564,7 +564,7 @@ def recap_card(d):
         g.rounded_rectangle((bar_x, y + 6, bar_x + bar_w * frac, y + 22), radius=8, fill=bc)
         g.text((W - M, y), f"{n['score']:.1f}" + (" ☂" if n.get("rain") else ""), font=f, fill=colr, anchor="ra")
         y += 34
-    g.text((M, Hh - 14), "Measured in a South Philly backyard, 8am–8pm · rain caps a day at 35 · bars zoomed to these five",
+    g.text((M, Hh - 14), "Measured from a South Philly rooftop, 8am–8pm · rain caps a day at 35 · bars zoomed to these five",
            font=font(16), fill=MUTED, anchor="lb")
     buf = io.BytesIO()
     im.save(buf, "PNG", optimize=True)
