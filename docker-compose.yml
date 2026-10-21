@@ -9,7 +9,8 @@ services:
       BSKY_APP_PASSWORD: ${BSKY_APP_PASSWORD}
       NJ_PLACE: ${NJ_PLACE:-South Philly}
       NJ_MORNING: ${NJ_MORNING:-07:00}
-      NJ_EVENING: ${NJ_EVENING:-20:30}
+      NJ_RECAP: ${NJ_RECAP:-20:30}
+      NJ_EVENING: ${NJ_EVENING:-20:31}
       NJ_DRY_RUN: ${NJ_DRY_RUN:-1}
       NJ_REPLIES: ${NJ_REPLIES:-dry}   # live | dry | off: answer @mentions with the live score
     volumes:

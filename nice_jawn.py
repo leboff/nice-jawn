@@ -1,14 +1,15 @@
 """Nice Jawn: posts South Philly's Nice score (Better Weather) to Bluesky.
 
   07:00  today's outlook        (sensor.better_weather_nice_today, all forecast hours at that time)
-  20:30  tomorrow's forecast    (sensor.better_weather_nice_tomorrow)
-         + how today's forecast did (sensor.better_weather_forecast_skill last_10, graded at 20:00)
+  20:30  recap of today         measured score, all-time rank, forecast vs measured; card = where today falls
+                                 in every measured day + the days ranked around it (sensor.better_weather_nice_day_rank)
+  20:31  tomorrow's forecast    (sensor.better_weather_nice_tomorrow)
 
 Text is a fixed template over real sensor numbers, no generated prose. Every post carries a card image
 (factor bars + hourly strip) with alt text.
 
 Usage:
-  python nice_jawn.py morning|evening [--dry-run] [--out DIR]   one post
+  python nice_jawn.py morning|recap|evening [--dry-run] [--out DIR]   one post
   python nice_jawn.py now [--out DIR]                             render the on-demand "right now" reply (never posts)
   python nice_jawn.py serve                                       scheduler + mention loop (container entrypoint)
 
@@ -133,10 +134,96 @@ def gather(slot):
         "breakdown": a.get("breakdown") or [], "why": a.get("why"),
         "high": a.get("high_f"), "low": a.get("low_f"), "daily": day_forecast(day),
     }
-    if slot == "evening":
-        d["lookback"] = lookback(now.date())
-        d["rank"] = day_rank(now.date())
     return d
+
+
+class NotReady(Exception):
+    """Today's data isn't final yet; the scheduler tries again shortly."""
+
+
+RECAP_WAIT_MIN = int(os.environ.get("NJ_RECAP_WAIT_MIN", "20"))
+
+
+def gather_recap(*, force=False):
+    """Today, measured. Waits for Better Weather to rank today (after 8pm, once the recorder has the last hour)."""
+    now = datetime.now(TZ)
+    today = now.date()
+    st = ha_state(RANK_ID)
+    a = st.get("attributes") or {}
+    latest = a.get("latest") or {}
+    ranked = latest.get("date") == today.isoformat()
+    if not ranked and not force:
+        raise NotReady(f"{RANK_ID} hasn't ranked {today} yet (latest ranked day {latest.get('date')})")
+    td = ha_state(TODAY_ID)
+    ta = td.get("attributes") or {}
+    score = latest["score"] if ranked else number(td)
+    if score is None:
+        raise RuntimeError("no measured score for today")
+    return {
+        "slot": "recap", "day": today, "score": round(score), "exact": score, "word": word(score),
+        "hours": local_hours(ta.get("hourly") or []), "rain": latest.get("rain") if ranked else bool(ta.get("rain_hours")),
+        "rank": day_rank(today) if ranked else None,
+        # chart data needs Better Weather >= 0.3.4; without it the recap uses the hourly card
+        "neighbors": a.get("neighbors") if ranked else None, "histogram": a.get("histogram") if ranked else None,
+        "lookback": lookback(today),
+    }
+
+
+def short_date(iso, today=None):
+    d = date.fromisoformat(iso)
+    y = "" if today and d.year == today.year else f", {d.year}"
+    return f"{d.strftime('%b')} {d.day}{y}"
+
+
+def recap_text(d):
+    dow = d["day"].strftime("%a %b ") + str(d["day"].day)
+    lines = [f"Today in {PLACE} ({dow}): {d['score']}/100, {d['word']}" + (" (rain)." if d["rain"] else ".")]
+    rk = d.get("rank")
+    if rk:
+        lines.append(rank_line(rk))
+        nb = d.get("neighbors") or []
+        me = next((i for i, n in enumerate(nb) if n["date"] == d["day"].isoformat()), None)
+        if me is not None:
+            above = [n for n in nb[:me] if n["score"] > d["exact"]]
+            below = nb[me + 1:]
+            if rk["rank"] == 2 and above:
+                lines.append(f"Only {short_date(above[-1]['date'], d['day'])} ({above[-1]['score']:g}) was better.")
+            elif rk["rank"] > 2 and above and below:
+                lines.append(f"Between {short_date(above[-1]['date'], d['day'])} ({above[-1]['score']:g}) "
+                             f"and {short_date(below[0]['date'], d['day'])} ({below[0]['score']:g}).")
+            elif rk["rank"] == 1 and below:
+                lines.append(f"Next best: {short_date(below[0]['date'], d['day'])} ({below[0]['score']:g}).")
+    lb = d.get("lookback")
+    if lb:
+        diff = lb["observed"] - lb["forecast"]
+        verdict = "called it" if abs(diff) <= 3 else f"{'+' if diff > 0 else '−'}{abs(diff)}"
+        lines.append(f"Last night's forecast: {lb['forecast']} ({verdict}).")
+    win = window_text(best_window([h for h in d["hours"] if h[2] == "station"]))
+    if win:
+        lines.append(f"Best stretch: {win}.")
+    for drop in (None, "Best stretch", "Between", "Only", "Next best"):
+        if drop:
+            lines = [ln for ln in lines if not ln.startswith(drop)]
+        text = "\n".join(lines)
+        if len(text) <= MAX_GRAPHEMES:
+            return text
+    return text[:MAX_GRAPHEMES]
+
+
+def recap_alt(d):
+    out = f"Recap card for {d['day'].strftime('%A %B')} {d['day'].day} in {PLACE}: measured {d['exact']:g} out of 100, {d['word']}."
+    rk, h = d.get("rank"), d.get("histogram")
+    if rk and h:
+        n = sum(h)
+        below = sum(h[: int(d["exact"])])
+        out += (f" {rank_line(rk)} Chart: how many of the {n} measured days scored each value from 0 to 100; "
+                f"today's marker sits above {round(100 * below / n)}% of them. ")
+        out += "Days ranked around it: " + "; ".join(
+            f"#{x['rank']} {short_date(x['date'])} {x['score']:g}" + (" (today)" if x["date"] == d["day"].isoformat() else "")
+            for x in d.get("neighbors") or []) + "."
+    else:
+        out += " Hourly scores: " + ", ".join(f"{hour_label(t.hour)} {s}" for t, s, _ in d["hours"]) + "."
+    return out[:2000]
 
 
 def day_rank(today):
@@ -234,13 +321,6 @@ def post_text(d):
         lines.append(f"Best stretch: {win}.")
     if factor_line(d["breakdown"]):
         lines.append(factor_line(d["breakdown"]))
-    lb = d.get("lookback")
-    if lb:
-        diff = lb["observed"] - lb["forecast"]
-        verdict = "called it" if abs(diff) <= 3 else f"{'+' if diff > 0 else '−'}{abs(diff)}"
-        lines.append(f"Today: forecast {lb['forecast']}, measured {lb['observed']} ({verdict}).")
-    if d.get("rank"):
-        lines.append(rank_line(d["rank"]))
     text = "\n".join(lines)
     while len(text) > MAX_GRAPHEMES and d["breakdown"]:
         lines = [ln for ln in lines if not ln.startswith("Docked")] + [factor_line(d["breakdown"], limit=1)]
@@ -255,8 +335,7 @@ def alt_text(d):
     hrs = ", ".join(f"{hour_label(t.hour)} {s}" for t, s, _ in d["hours"])
     rows = "; ".join(f"{r['label']} {round(r['points'])} of {round(r['max'])} ({r.get('detail', '')})" for r in d["breakdown"])
     return (f"Nice score card for {d['day'].strftime('%A %B')} {d['day'].day} in {PLACE}: {d['score']} out of 100, {d['word']}. "
-            f"Factors: {rows}. Hourly scores: {hrs}."
-            + (f" {rank_line(d['rank'])}" if d.get("rank") else ""))[:2000]
+            f"Factors: {rows}. Hourly scores: {hrs}.")[:2000]
 
 
 def gather_now():
@@ -414,6 +493,84 @@ def card(d):
     return buf.getvalue()
 
 
+def recap_card(d):
+    """Where today falls among every measured day: distribution with a marker + the days ranked around it."""
+    im = Image.new("RGB", (W, Hh), BG)
+    g = ImageDraw.Draw(im)
+    M = 56
+    rk, hist, nb = d["rank"], d["histogram"], d["neighbors"]
+    today_iso = d["day"].isoformat()
+    g.text((M, 44), "NICE JAWN · TODAY'S RECAP", font=font(22, True), fill=MUTED)
+    g.text((M, 74), f"{d['day'].strftime('%A, %B')} {d['day'].day} · {PLACE}", font=font(30, True), fill=FG)
+    place = f"#{rk['rank']}" + (" (tie)" if rk["tied"] else "")
+    since = date.fromisoformat(rk["since"]) if rk.get("since") else None
+    g.text((M, 116), f"{place} of {rk['of']} days measured" + (f" since {since.strftime('%b')} {since.year}" if since else ""),
+           font=font(24), fill=MUTED)
+    hue = col(d["exact"])     # one colour for today everywhere on the card
+    g.text((W - M, 40), f"{d['exact']:.1f}", font=font(100, True), fill=hue, anchor="ra")
+    g.text((W - M, 158), d["word"], font=font(28, True), fill=FG, anchor="ra")
+
+    # distribution: 2-point bins, today's bin in full color, the rest faded
+    top, base, x0, x1 = 214, 372, M, W - M
+    bins = [sum(hist[i:i + 2]) for i in range(0, 100, 2)]
+    bins[-1] += hist[100]
+    peak = max(bins) or 1
+    bw = (x1 - x0) / len(bins)
+    tb = min(int(d["exact"]) // 2, len(bins) - 1)
+    today_top = base
+    for i, c in enumerate(bins):
+        if not c:
+            continue
+        h = max(4, (base - top - 26) * c / peak)
+        if i == tb:
+            h = max(h, 12)                  # today's bin always visible, even when it's a lonely top day
+            colr = hue
+            today_top = base - h
+        else:
+            colr = tuple(int(v + (b - v) * 0.62) for v, b in zip(col(i * 2 + 1), BG))
+        g.rounded_rectangle((x0 + i * bw + 1.5, base - h, x0 + (i + 1) * bw - 1.5, base), radius=3, fill=colr)
+        if i == 17 and c == peak:           # the 34-36 bin: every rainy day is capped at 35
+            g.text((x0 + (i + 1) * bw + 8, base - h + 2), "rain days", font=font(17), fill=MUTED, anchor="la")
+    g.line([(x0, base + 1), (x1, base + 1)], fill=TRACK, width=2)
+    for v in (0, 25, 50, 75, 100):
+        g.text((x0 + (x1 - x0) * v / 100, base + 8), str(v), font=font(18), fill=MUTED,
+               anchor="la" if v == 0 else "ra" if v == 100 else "ma")
+    mx = x0 + (tb + 0.5) * bw                 # pointer over the centre of today's bin, stopping at its top
+    g.line([(mx, top + 22), (mx, today_top - 4)], fill=FG, width=3)
+    g.polygon([(mx - 7, today_top - 12), (mx + 7, today_top - 12), (mx, today_top - 3)], fill=FG)
+    lbl = f"today {d['exact']:.1f}"
+    anchor = "ra" if mx > x1 - 120 else "la" if mx < x0 + 120 else "ma"
+    g.text((mx + (-8 if anchor == "ra" else 8 if anchor == "la" else 0), top - 4), lbl, font=font(20, True), fill=FG, anchor=anchor)
+    g.text((x0, top - 4), "Every measured day", font=font(20, True), fill=MUTED, anchor="la") if anchor != "la" else None
+
+    # the days ranked around it
+    y = 418
+    g.text((M, y), "Ranked around it", font=font(20, True), fill=MUTED)
+    y += 32
+    lo = min(n["score"] for n in nb)
+    hi = max(n["score"] for n in nb)
+    span = max(hi - lo, 1.0)
+    for n in nb:
+        me = n["date"] == today_iso
+        f = font(23, me)
+        colr = FG if me else MUTED
+        dd = date.fromisoformat(n["date"])
+        g.text((M, y), f"#{n['rank']}", font=f, fill=colr)
+        g.text((M + 76, y), ("Today · " if me else "") + f"{dd.strftime('%a %b')} {dd.day}, {dd.year}", font=f, fill=colr)
+        bar_x, bar_w = M + 470, 470
+        # bars scaled to the window so a 0.1-point gap is visible; the number carries the real value
+        frac = 0.35 + 0.65 * (n["score"] - lo) / span
+        bc = hue if me else tuple(int(v + (b - v) * 0.5) for v, b in zip(col(n["score"]), BG))
+        g.rounded_rectangle((bar_x, y + 6, bar_x + bar_w * frac, y + 22), radius=8, fill=bc)
+        g.text((W - M, y), f"{n['score']:.1f}" + (" ☂" if n.get("rain") else ""), font=f, fill=colr, anchor="ra")
+        y += 34
+    g.text((M, Hh - 14), "Measured in a South Philly backyard, 8am–8pm · rain caps a day at 35 · bars zoomed to these five",
+           font=font(16), fill=MUTED, anchor="lb")
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
 # ---------------------------------------------------------------- bluesky
 class Bsky:
     """One login, reused: refreshes on expiry instead of calling createSession every poll (that's rate-limited)."""
@@ -511,8 +668,6 @@ def ts(s):
 def build_reply(text_in):
     if TOMORROW_RE.search(text_in or ""):
         d = gather("evening")
-        d.pop("lookback", None)
-        d.pop("rank", None)
         return post_text(d), card(d), alt_text(d), "tomorrow"
     d = gather_now()
     return now_text(d), card(d), now_alt(d), "now"
@@ -581,11 +736,14 @@ def save_state(st):
     tmp.replace(STATE_DIR / "state.json")
 
 
-def run(slot, *, dry_run=False, out=None):
+def run(slot, *, dry_run=False, out=None, force=False):
     if slot == "now":
         d = gather_now()
         text, png, alt = now_text(d), card(d), now_alt(d)
         dry_run = True      # "now" is only ever a reply; rendering it standalone never posts
+    elif slot == "recap":
+        d = gather_recap(force=force)
+        text, png, alt = recap_text(d), recap_card(d) if d.get("histogram") else card(d | {"slot": "morning", "breakdown": []}), recap_alt(d)
     else:
         d = gather(slot)
         text, png, alt = post_text(d), card(d), alt_text(d)
@@ -611,7 +769,7 @@ def slot_times(day):
     def at(env, default):
         hh, mm = map(int, os.environ.get(env, default).split(":"))
         return datetime(day.year, day.month, day.day, hh, mm, tzinfo=TZ)
-    return {"morning": at("NJ_MORNING", "07:00"), "evening": at("NJ_EVENING", "20:30")}
+    return {"morning": at("NJ_MORNING", "07:00"), "recap": at("NJ_RECAP", "20:30"), "evening": at("NJ_EVENING", "20:31")}
 
 
 def serve():
@@ -620,9 +778,9 @@ def serve():
     log.info("serving: %s, dry_run=%s, replies=%s", {k: v.strftime("%H:%M") for k, v in slot_times(date.today()).items()},
              os.environ.get("NJ_DRY_RUN") == "1", replies)
     # Startup self-check: render every post type without posting, so a deploy proves HA + rendering work.
-    for slot in ("morning", "evening", "now"):
+    for slot in ("morning", "recap", "evening", "now"):
         try:
-            run(slot, dry_run=True)
+            run(slot, dry_run=True, force=True)
         except Exception:  # noqa: BLE001
             log.exception("startup self-check failed for %s", slot)
     poll = int(os.environ.get("NJ_MENTION_POLL_S", "20"))
@@ -637,10 +795,14 @@ def serve():
                 continue
             for attempt in range(3):
                 try:
-                    run(slot)
+                    # Recap waits for today's rank; past the wait it goes out without the rank rather than not at all.
+                    run(slot, force=slot == "recap" and now >= at + timedelta(minutes=RECAP_WAIT_MIN))
                     st = load_state()
                     st["posted"] = sorted(set(st.get("posted", [])) | {key})[-30:]
                     save_state(st)
+                    break
+                except NotReady as e:
+                    log.info("%s: %s; retrying", slot, e)
                     break
                 except Exception:  # noqa: BLE001 - log and retry; never crash the loop
                     log.exception("%s attempt %d failed", slot, attempt + 1)
@@ -663,4 +825,4 @@ if __name__ == "__main__":
         serve()
     else:
         out = args[args.index("--out") + 1] if "--out" in args else None
-        run(args[0], dry_run="--dry-run" in args, out=out)
+        run(args[0], dry_run="--dry-run" in args, out=out, force="--force" in args)

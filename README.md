@@ -4,7 +4,10 @@ Posts South Philly's outdoor Nice score (from the [Better Weather](https://githu
 Home Assistant integration) to Bluesky as [@nice.bof.fish](https://bsky.app/profile/nice.bof.fish).
 
 - **07:00**: today's outlook (score, high/low, rain, best stretch, what's docking it).
-- **20:30**: tomorrow's forecast, plus how today's forecast did against the backyard station.
+- **20:30**: recap of today: measured score, all-time rank, the day just above/below it, how last night's forecast did.
+  The card shows where today falls in every measured day (distribution + the five days ranked around it).
+  Waits up to 20 min for Better Weather to rank today; after that it posts without the rank.
+- **20:31**: tomorrow's forecast.
 
 - **On demand:** mention it ("hey @nice.bof.fish how are we looking") and it replies in-thread with the live score and a
   card of today's hours (solid = measured, faded = forecast). Say "tomorrow" to get tomorrow's forecast instead.
